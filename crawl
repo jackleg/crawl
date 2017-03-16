@@ -1,0 +1,386 @@
+#!/usr/bin/env python
+# -*- coding: utf8 -*-
+
+import sys
+import argparse
+import logging
+import json
+import ConfigParser
+import threading
+import os.path
+import itertools
+from collections import namedtuple, OrderedDict
+import Queue
+import re
+
+import requests
+
+from putils import *
+
+# 이부 엔진의 ranker info에서 "cutoff":true 인 부분이 "cutoff:true"로 출력되는 버그가 있었다.
+# 이 버그를 수정하기 위해 아래와 같은 regexp로 잡아서 수동으로 수정함.
+CUTOFF_PROG = re.compile(r'"cutoff:(true|false)"')
+
+class SearchQueryInfo():
+    """query info."""
+    def __init__(self, qid, query, url, docid, qtc=None, simboost_term_count=None, res_count=None):
+        self.qid = qid
+        self.query = query
+        self.url = url
+        self.docid = docid
+        self.qtc = qtc
+        self.simboost_term_count = simboost_term_count
+        self.res_count = res_count
+
+    def __str__(self):
+        """qid, query, qtc 중 값이 있는 필드만 join."""
+        fields = [self.qid, self.query, self.qtc, self.simboost_term_count, self.res_count]
+        return strutil.str_join(filter(lambda item: item is not None, fields))
+
+            
+class Record():
+    """검색 결과 하나의 문서
+   
+    문서를 나타내는 속성 필드들은 가변적이며, 입력된 순서대로 출력한다..
+    """
+
+    def __init__(self):
+        self.fields = OrderedDict()
+    
+    def __str__(self):
+        return strutil.str_join(self.fields.values())
+
+    def put(self, fieldname, value):
+        self.fields[fieldname] = value
+
+    def get(self, fieldname):
+        return self.fields[fieldname]
+
+
+class Serp():
+    """하나의 검색 결과를 저장하는 클래스"""
+
+    def __init__(self, sq, records=None, serp_str=None):
+        self.sq = sq
+        self.serp_str = serp_str 
+
+        if records is None: records = []
+        self.records = records
+
+    def add_record(self, record):
+        self.records.append(record)
+
+    def __str__(self):
+        if self.serp_str is not None:
+            return "{sq}\t{serp}".format(sq=self.sq, serp=self.serp_str)
+        else:
+            record_strs = ["{sq}\t{rank}\t{record}".format(sq=self.sq, rank=rank, record=record) \
+                                 for rank, record in enumerate(self.records, start=1)]
+            return strutil.str_join(record_strs, sep="\n")
+
+
+class Searcher(threading.Thread):
+    def __init__(self, id, in_queue, base_url, params, get_scores, element_list, ranker_info, dump_doc, dump_serp, out_queue):
+        super(Searcher, self).__init__()
+        self.id = id
+        self.in_queue = in_queue
+        self.base_url = base_url
+        self.params = params.copy()
+        self.get_scores = get_scores
+        self.kill_received = False
+        self.element_list = element_list
+        self.ranker_info = ranker_info
+        self.dump_doc = dump_doc
+        self.dump_serp = dump_serp
+        self.out_queue = out_queue
+
+    def _get_qtc(self, meta):
+        """질의의 QTC를 구한다.
+        
+        meta dictionary에 있는 morpheme 정보를 이용한다.
+        morpheme 사전에 있는 query_term_count 필드를 확인.
+        이 필드가 없다면 morpheme 사전에 있는 'search_query_list'의 첫번째 질의(q[0]) term list를 사용함.
+
+        :return: QTC. meta에서 morpheme 정보를 얻을 수 없거나, 질의 term 정보가 없는 경우에는 None.
+        """
+
+        try:
+            morpheme = meta['morpheme']
+
+            if "query_term_count" in morpheme:
+                return morpheme["query_term_count"]
+
+            rq = morpheme['search_query_list'][0]
+            
+            if rq:
+                terms_info = rq[0]['query']
+                terms = map(lambda term_dict: term_dict['terms'][0]['str'].encode('utf8'), terms_info)
+                return len(terms)
+            else:
+                # dha 분석 후 term이 하나도 없는 경우.
+                # 이 경우 어차피 검색 결과도 없다.
+                return None
+        except KeyError:
+            # morpheme 정보가 없는 경우
+            return None
+        except IndexError:
+            # morpheme 정보는 있으나 질의 정보가 없는 경우
+            logging.info("query[%s] has invalid morpheme result." % meta['query'].encode('utf8'))
+            return None
+
+    def _get_simboost_term_count(self, meta):
+        """질의의 simboost term count를 구한다.
+        
+        meta dictionary에 있는 morpheme 정보를 이용한다.
+        morpheme/simboost_query_list 의 정보를 사용한다.
+
+        :return: simboost term count. meta에서 morpheme 정보를 얻을 수 없거나, 질의 term 정보가 없는 경우에는 None.
+        """
+
+        try:
+            morpheme = meta['morpheme']
+            sq = morpheme['simboost_query_list'][0]
+            
+            if sq:
+                terms_info = sq[0]['query']
+                return len(terms_info)
+            else:
+                # dha 분석 후 term이 하나도 없는 경우.
+                # 이 경우 어차피 검색 결과도 없다.
+                return None
+        except KeyError:
+            # morpheme 정보가 없는 경우
+            return None
+        except IndexError:
+            # morpheme 정보는 있으나 질의 정보가 없는 경우
+            logging.info("query[%s] has invalid morpheme result." % meta['query'].encode('utf8'))
+            return None
+
+
+    def run(self):
+        logging.debug("[%d]-worker started." % (self.id))
+
+        sq_count = 0 
+        while self.in_queue.qsize() > 0:
+            if self.kill_received:
+                logging.info('search worker [%d] killed.' % self.id)
+                break
+
+            ordering_id, sqinfo = self.in_queue.get()
+
+            # set query option
+            if sqinfo.query is not None:
+                self.params['q'] = sqinfo.query
+            if sqinfo.url is not None: self.params['url'] = sqinfo.url
+            if sqinfo.docid is not None: self.params['docid'] = sqinfo.docid
+
+            r = requests.get(self.base_url, params=self.params)
+            logging.debug("[%d]-worker: [%s]" % (self.id, r.url))
+
+            # 비정상 코드인 경우 skip.
+            if r.status_code != 200:
+                logging.info("[{id}]-worker:ABNORMAL STATUS CODE:[{r.status_code}][{r.url}]".format(id=self.id, r=r))
+                continue
+
+            try:
+                tree = r.json()
+                sqinfo.qtc = self._get_qtc(tree['m'])
+                sqinfo.simboost_term_count = self._get_simboost_term_count(tree['m'])
+                sqinfo.res_count = long(tree['m']['c'])
+
+                serp = Serp(sqinfo)
+
+                if self.dump_serp:
+                    serp.serp_str = json.dumps(tree)
+                else:
+                    for data in tree.get('ds'):
+                        # save documents as Record
+                        record = Record()
+
+                        for element_name in self.element_list:
+                            record.put(element_name, strutil.get_json_value(data, element_name))
+
+                        if self.ranker_info:
+                            ranker_info_str = data.get("debug").get("ranker_info")
+                            ranker_info_str = CUTOFF_PROG.sub(r'"cutoff":\1', ranker_info_str) # CUTOFF_PROG 참고. 
+
+                            json_obj = json.loads(ranker_info_str)
+                                
+                            for element_name in self.ranker_info:
+                                record.put(element_name, strutil.get_json_value(json_obj, element_name))
+
+                        if self.get_scores:
+                            scores_str = strutil.get_json_value(data, "scores")
+                            scores_list = json.loads(scores_str)
+                            record.put('scores', strutil.str_join(scores_list))
+
+                        if self.dump_doc:
+                            record.put('dumped_doc', json.dumps(data))
+
+                        serp.add_record(record)
+                    
+                self.out_queue.put((ordering_id, serp))
+                sq_count += 1
+                
+            except ValueError as e:
+                logging.info(e)
+                if sqinfo.query:
+                    logging.info("[VALUE_ERROR] check query[{query}], url[{r.url}]".format(query=sqinfo.query, r=r))
+                else: 
+                    logging.info("[VALUE_ERROR] check url[{r.url}]".format(r=r))
+
+            if (sq_count % 100) == 0:
+                    logging.info("...[%d]-worker processed [%d] query." % (self.id, sq_count))
+
+        if (sq_count % 100) != 0: # 100의 배수이면 loop안에서 이미 출력함.
+            logging.info("...[%d]-worker processed [%d] query." % (self.id, sq_count))
+
+    def kill(self):
+        self.kill_received = True
+
+
+def parse_config(fp, collection):
+    """config file을 parsing해서 dictionary로 전달"""
+    config = ConfigParser.ConfigParser()
+    config.readfp(fp)
+
+    return dict(config.items(collection))
+
+
+def make_sq_queue(infile, query_field, qid_field, url_field, docid_field, comment_char='#'):
+    """infile file에서 query 정보를 읽어 queue로 반환한다.
+
+    comment_char로 시작하는 라인은 주석으로 판단하고 무시한다.
+
+    :param infile: query 정보가 담긴 파일.
+    :param query_field: infile에서 query field.
+    :param qid_field: infile에서 qid field.
+    :param url_field: infile에서 url field.
+    :param docid_field: infile에서 docid field.
+    :param comment_char: 주석으로 사용할 character.
+    :return: (ordering_id, (qid, query, url, docid)) pair를 item으로 가지고 있는 queue.
+    """
+
+    logging.info("load query file: %s" % infile.name)
+
+    # set up query field index
+    query_index = (query_field - 1) if query_field > 0 else None
+    qid_index = (qid_field - 1) if qid_field > 0 else None
+    url_index = (url_field - 1) if url_field > 0 else None
+    docid_index = (docid_field - 1) if docid_field > 0 else None
+
+    queue = Queue.Queue()
+    q_c = 0
+    for line in infile:
+        if line[0] == comment_char: continue # skip comment line.
+
+        tokens = line.rstrip().split("\t")
+
+        qid, query, url, docid = [None] * 4
+
+        if qid_index is not None:
+            qid = int(tokens[qid_index])
+        if query_index is not None:
+            query = tokens[query_index]
+        if url_index is not None:
+            url = tokens[url_index]
+        if docid_index is not None:
+            docid = tokens[docid_index]
+
+        queue.put((q_c, SearchQueryInfo(qid, query, url, docid)))
+        q_c += 1
+
+    logging.info("    loaded [%d]-query." % q_c)
+    return queue
+
+
+def make_argument_parser():
+    # main
+    parser = argparse.ArgumentParser(description='crawl search result.', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument("--num", type=int, default=10, help="number of search results.")
+
+    # query type setting
+    parser.add_argument("--infile", type=file, default=sys.stdin, help="query file.")
+    parser.add_argument("--query", type=int, default=1, help="query field num. starts from 1. 0 if no query.")
+    parser.add_argument("--qid", type=int, default=0, help="qid field num. starts from 1. 0 if no qid.")
+    parser.add_argument("--url", type=int, default=0, help="url field num. starts from 1. 0 if no url.")
+    parser.add_argument("--docid", type=int, default=0, help="docid field num. starts from 1. 0 if no docid. if 'url' is setted, this option is ignored.")
+    parser.add_argument("--comment", default='#', help="comment character.")
+
+    # output format setting
+    parser.add_argument("--outfile", type=argparse.FileType('w'), default=sys.stdout, help="output file.")
+    parser.add_argument("--element", action='append', default=['url'], help="elements to retrieve.")
+    parser.add_argument("--scores", action='store_true', help='get scores of calculators.')
+    parser.add_argument("--debug", action='store_true', help="use debug mode.")
+    parser.add_argument("--ranker_info", action='append', default=[], help="elements from ranker info.")
+    parser.add_argument("--dump_doc", action='store_true', help="dump documents in json format.")
+    parser.add_argument("--dump_serp", action='store_true', help="dump all serp as string.")
+
+    # crawl config & search option
+    parser.add_argument("--config", type=file, default=os.path.join(sys.prefix, "crawl_config", "crawl.cfg"), help="config file to crawl.")
+    parser.add_argument("--cond", help="filtering condition.")
+    parser.add_argument("--rankopt", help="uncommon rank option. A=a;B=b;C=c;")
+
+    # script level option
+    parser.add_argument("--log_level", default="info", help="log level.")
+    parser.add_argument("--workers", type=int, default=1, help="workers to get SERP concurrently.")
+
+    # collection
+    parser.add_argument("collection", help="collection name to crawl. must be one of the config file section.")
+
+    return parser
+
+
+if __name__ == "__main__":
+    args = make_argument_parser().parse_args()
+
+    # supress requests logging
+    requests_logger = logging.getLogger('requests')
+    requests_logger.addHandler(logging.NullHandler())
+    requests_logger.propagate = False
+
+    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    logging.basicConfig(level=log_level, format="[%(levelname)s][%(asctime)s] %(message)s")
+
+    logging.info("get search result for query[{args.infile.name}] for [{args.collection}]".format(args=args))
+
+    options = parse_config(args.config, args.collection)
+    BASE_SEARCH_URL = options.pop('base_url')
+
+    if args.scores: options['include_scores'] = 'true'
+
+    # override search option
+    options.update(dict(n=args.num, rankopt=args.rankopt, cond=args.cond))
+    if args.debug or args.ranker_info: options["debug"] = "true" # debug mode를 셋팅했거나 debug info가 필요한 경우, debug 옵션 추가.
+
+    # make input query queue and output priority queue
+    # priority queue는 질의 입력 순서를 유지하기 위함.
+    in_queue = make_sq_queue(args.infile, args.query, args.qid, args.url, args.docid, args.comment)
+    out_queue = Queue.PriorityQueue()
+
+    # get serp with threads
+    threads = []
+    for i in range(args.workers):
+        t = Searcher(i, in_queue, BASE_SEARCH_URL, options, args.scores, args.element, args.ranker_info, args.dump_doc, args.dump_serp, out_queue)
+        threads.append(t)
+        t.start()
+
+    # thread joining
+    while len(threads) > 0:
+        try:
+            for t in threads:
+                t.join(1)
+
+            threads = [t for t in threads if t.isAlive()]
+        except KeyboardInterrupt:
+            logging.info("Ctrl-c received.")
+            for t in threads:
+                t.kill()
+
+    # print out results
+    logging.info("writing result into file: %s" % args.outfile.name)
+    while out_queue.qsize() > 0:
+        ordering_id, serp = out_queue.get()
+        args.outfile.write("%s\n" % serp)
+
+    logging.info("Done.")
